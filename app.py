@@ -373,14 +373,14 @@ if not st.session_state.messages:
             "💳",
             "Langganan & TontonUp",
             "Cara melanggan, menaik taraf atau aktifkan pelan",
-            "Bagaimana cara melanggan atau menaik taraf akaun TontonUp?",
+            "Bagaimana saya nak membatalkan langganan bulanan TontonUp saya?",
         ),
         (
             col2,
             "👤",
             "Akaun & Kata Laluan",
             "Lupa kata laluan atau pautan reset akaun",
-            "Bagaimana saya nak menukar atau menetapkan semula kata laluan?",
+            "Bagaimana saya nak menukar kata laluan?",
         ),
         (
             col3,
