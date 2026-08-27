@@ -35,6 +35,20 @@ def get_embedding_function(
     return GoogleGenerativeAIEmbeddings(**kwargs)
 
 
+import threading
+
+_CLIENT_CACHE: Dict[str, QdrantClient] = {}
+_CLIENT_LOCK = threading.Lock()
+
+
+def get_embedding_dimension(model_name: Optional[str] = None) -> int:
+    """Returns default dimension based on the active model name."""
+    model = (model_name or settings.embedding_model).lower()
+    if "gemini-embedding-2" in model:
+        return 3072
+    return 768
+
+
 class QdrantManager:
     """Manages Qdrant vector database connection, collections, and vector search."""
 
@@ -42,30 +56,43 @@ class QdrantManager:
         self,
         storage_path: Optional[str] = None,
         collection_name: Optional[str] = None,
-        embedding_dim: int = 768,
+        embedding_dim: Optional[int] = None,
         in_memory: bool = False,
     ):
-        """Initializes the Qdrant client and verifies collection availability."""
+        """Initializes the Qdrant client using a shared thread-safe connection."""
         self.collection_name = collection_name or settings.qdrant_collection_name
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = embedding_dim or get_embedding_dimension()
         self.in_memory = in_memory
 
         if self.in_memory:
-            logger.info("Initializing in-memory Qdrant client for testing")
             self.client = QdrantClient(location=":memory:")
         else:
-            db_path = Path(storage_path or settings.qdrant_storage_path)
-            db_path.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Initializing persistent local Qdrant client at {db_path.resolve()}")
-            self.client = QdrantClient(path=str(db_path))
+            db_path = str(Path(storage_path or settings.qdrant_storage_path).resolve())
+            with _CLIENT_LOCK:
+                if db_path not in _CLIENT_CACHE:
+                    Path(db_path).mkdir(parents=True, exist_ok=True)
+                    logger.info(f"Initializing persistent local Qdrant client at {db_path}")
+                    _CLIENT_CACHE[db_path] = QdrantClient(path=db_path)
+                self.client = _CLIENT_CACHE[db_path]
 
     def ensure_collection(self, recreate: bool = False) -> None:
-        """Ensures that the target collection exists with Cosine similarity metric."""
+        """Ensures that the target collection exists with Cosine similarity metric and matching vector dimension."""
+        exists = False
         try:
             collections = self.client.get_collections().collections
             exists = any(c.name == self.collection_name for c in collections)
+            if exists and not recreate:
+                info = self.client.get_collection(collection_name=self.collection_name)
+                existing_dim = getattr(info.config.params.vectors, "size", None)
+                if existing_dim and existing_dim != self.embedding_dim:
+                    logger.warning(
+                        f"Collection '{self.collection_name}' has dimension {existing_dim}, "
+                        f"but current model requires {self.embedding_dim}. Recreating collection..."
+                    )
+                    self.client.delete_collection(self.collection_name)
+                    exists = False
         except Exception as e:
-            logger.debug(f"Could not retrieve collections list: {e}")
+            logger.debug(f"Could not inspect collection '{self.collection_name}': {e}")
             exists = False
 
         if exists and recreate:
@@ -100,6 +127,9 @@ class QdrantManager:
         if len(documents) != len(embeddings):
             raise ValueError(f"Document count ({len(documents)}) does not match embedding count ({len(embeddings)})")
 
+        if embeddings and len(embeddings[0]) != self.embedding_dim:
+            self.embedding_dim = len(embeddings[0])
+
         self.ensure_collection()
 
         points = []
@@ -131,6 +161,9 @@ class QdrantManager:
         score_threshold: Optional[float] = None,
     ) -> List[Tuple[Document, float]]:
         """Performs cosine similarity search against Qdrant collection."""
+        if query_vector and len(query_vector) != self.embedding_dim:
+            self.embedding_dim = len(query_vector)
+
         self.ensure_collection()
         try:
             search_result = self.client.query_points(
