@@ -117,6 +117,13 @@ def retrieve_node(state: GraphState) -> GraphState:
             storage_path=settings.qdrant_storage_path,
             collection_name=settings.qdrant_collection_name,
         )
+        if qdrant.get_collection_count() == 0 and settings.effective_api_key:
+            logger.info("Empty Qdrant collection detected during retrieval. Running on-demand indexing...")
+            try:
+                from src.ingestion.indexer import run_indexing
+                run_indexing(recreate_collection=False)
+            except Exception as idx_err:
+                logger.warning(f"On-demand FAQ indexing failed: {idx_err}")
 
         fetch_limit = max(settings.retrieval_candidate_count, settings.top_k_results * 3)
 

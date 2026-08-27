@@ -239,16 +239,17 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Auto-indexing on Startup (Ensures seamless Cloud deployment)
 # ---------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Menyediakan pangkalan data FAQ...")
 def _ensure_faq_indexed() -> None:
     """Ensures Qdrant database contains FAQ items on initial application boot."""
+    if not settings.effective_api_key:
+        return
     try:
         from src.vectorstore.qdrant_client import QdrantManager
         qdrant = QdrantManager(
             storage_path=settings.qdrant_storage_path,
             collection_name=settings.qdrant_collection_name,
         )
-        if qdrant.get_collection_count() == 0 and settings.effective_api_key:
+        if qdrant.get_collection_count() == 0:
             logger.info("Empty Qdrant collection detected on startup. Auto-indexing FAQ...")
             from src.ingestion.indexer import run_indexing
             run_indexing(recreate_collection=False)

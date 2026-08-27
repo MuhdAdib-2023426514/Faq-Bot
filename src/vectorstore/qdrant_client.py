@@ -61,25 +61,35 @@ class QdrantManager:
 
     def ensure_collection(self, recreate: bool = False) -> None:
         """Ensures that the target collection exists with Cosine similarity metric."""
-        collections = self.client.get_collections().collections
-        exists = any(c.name == self.collection_name for c in collections)
+        try:
+            collections = self.client.get_collections().collections
+            exists = any(c.name == self.collection_name for c in collections)
+        except Exception as e:
+            logger.debug(f"Could not retrieve collections list: {e}")
+            exists = False
 
         if exists and recreate:
             logger.info(f"Recreating collection '{self.collection_name}'...")
-            self.client.delete_collection(self.collection_name)
+            try:
+                self.client.delete_collection(self.collection_name)
+            except Exception:
+                pass
             exists = False
 
         if not exists:
             logger.info(f"Creating Qdrant collection '{self.collection_name}' (dim={self.embedding_dim}, metric=Cosine)")
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=rest.VectorParams(
-                    size=self.embedding_dim,
-                    distance=rest.Distance.COSINE,
-                ),
-            )
+            try:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=rest.VectorParams(
+                        size=self.embedding_dim,
+                        distance=rest.Distance.COSINE,
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create collection '{self.collection_name}': {e}")
         else:
-            logger.info(f"Qdrant collection '{self.collection_name}' is ready")
+            logger.debug(f"Qdrant collection '{self.collection_name}' is ready")
 
     def upsert_documents(
         self,
@@ -121,13 +131,18 @@ class QdrantManager:
         score_threshold: Optional[float] = None,
     ) -> List[Tuple[Document, float]]:
         """Performs cosine similarity search against Qdrant collection."""
-        search_result = self.client.query_points(
-            collection_name=self.collection_name,
-            query=query_vector,
-            limit=top_k,
-            score_threshold=score_threshold,
-            with_payload=True,
-        )
+        self.ensure_collection()
+        try:
+            search_result = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_vector,
+                limit=top_k,
+                score_threshold=score_threshold,
+                with_payload=True,
+            )
+        except Exception as e:
+            logger.warning(f"Similarity search in '{self.collection_name}' returned: {e}")
+            return []
 
         results: List[Tuple[Document, float]] = []
         for hit in search_result.points:
@@ -159,6 +174,7 @@ class QdrantManager:
         Returns:
             List of all Document objects stored in the collection.
         """
+        self.ensure_collection()
         documents: List[Document] = []
         offset = None
 
