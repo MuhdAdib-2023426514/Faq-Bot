@@ -22,6 +22,10 @@ class Settings(BaseSettings):
         default="",
         description="Google Gemini API Key for model inference and embeddings",
     )
+    google_api_key: str = Field(
+        default="",
+        description="Google API Key alias",
+    )
     jina_api: str = Field(
         default="",
         description="Jina AI API Key for cross-encoder reranker inference",
@@ -147,18 +151,33 @@ class Settings(BaseSettings):
     @property
     def effective_api_key(self) -> str:
         """Returns the active Gemini API key from settings, environment, or Streamlit secrets."""
-        key = self.gemini_api_key or ""
+        key = self.gemini_api_key or self.google_api_key or ""
         if not key:
             import os
-            key = os.environ.get("GEMINI_API_KEY", "")
+            key = (
+                os.environ.get("GEMINI_API_KEY", "")
+                or os.environ.get("GOOGLE_API_KEY", "")
+                or os.environ.get("gemini_api_key", "")
+                or os.environ.get("google_api_key", "")
+            )
         if not key:
             try:
                 import streamlit as st
-                if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-                    key = str(st.secrets["GEMINI_API_KEY"])
+                if hasattr(st, "secrets"):
+                    key = (
+                        st.secrets.get("GEMINI_API_KEY", "")
+                        or st.secrets.get("GOOGLE_API_KEY", "")
+                        or st.secrets.get("gemini_api_key", "")
+                        or st.secrets.get("google_api_key", "")
+                    )
             except Exception:
                 pass
-        return key.strip().strip('"').strip("'")
+        clean_key = str(key).strip().strip('"').strip("'")
+        if clean_key:
+            import os
+            os.environ.setdefault("GEMINI_API_KEY", clean_key)
+            os.environ.setdefault("GOOGLE_API_KEY", clean_key)
+        return clean_key
 
     @property
     def effective_jina_api_key(self) -> str:
@@ -166,15 +185,30 @@ class Settings(BaseSettings):
         key = self.jina_api or self.jina_api_key or ""
         if not key:
             import os
-            key = os.environ.get("JINA_API", "") or os.environ.get("JINA_API_KEY", "")
+            key = (
+                os.environ.get("JINA_API", "")
+                or os.environ.get("JINA_API_KEY", "")
+                or os.environ.get("jina_api", "")
+                or os.environ.get("jina_api_key", "")
+            )
         if not key:
             try:
                 import streamlit as st
                 if hasattr(st, "secrets"):
-                    key = str(st.secrets.get("JINA_API", "") or st.secrets.get("JINA_API_KEY", ""))
+                    key = (
+                        st.secrets.get("JINA_API", "")
+                        or st.secrets.get("JINA_API_KEY", "")
+                        or st.secrets.get("jina_api", "")
+                        or st.secrets.get("jina_api_key", "")
+                    )
             except Exception:
                 pass
-        return key.strip().strip('"').strip("'")
+        clean_key = str(key).strip().strip('"').strip("'")
+        if clean_key:
+            import os
+            os.environ.setdefault("JINA_API", clean_key)
+            os.environ.setdefault("JINA_API_KEY", clean_key)
+        return clean_key
 
 
 @lru_cache()

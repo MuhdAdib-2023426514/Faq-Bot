@@ -26,8 +26,9 @@ def get_embedding_function(
 
     kwargs: Dict[str, Any] = {
         "model": model,
-        "google_api_key": key,
     }
+    if key:
+        kwargs["google_api_key"] = key
     if task_type:
         kwargs["task_type"] = task_type
 

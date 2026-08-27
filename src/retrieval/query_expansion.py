@@ -18,11 +18,14 @@ from src.utils.normalizer import normalize_query
 
 def _get_llm() -> ChatGoogleGenerativeAI:
     """Returns a low-temperature Gemini instance for deterministic query processing."""
-    return ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
-        google_api_key=settings.effective_api_key,
-        temperature=0.0,
-    )
+    api_key = settings.effective_api_key
+    kwargs = {
+        "model": settings.gemini_model,
+        "temperature": 0.0,
+    }
+    if api_key:
+        kwargs["google_api_key"] = api_key
+    return ChatGoogleGenerativeAI(**kwargs)
 
 
 def format_chat_history_for_prompt(chat_history: Sequence[BaseMessage], max_messages: int = 4) -> str:

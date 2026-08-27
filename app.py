@@ -352,6 +352,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if not settings.effective_api_key:
+    st.error(
+        "⚠️ **Kunci API Gemini Tidak Dikesan / Gemini API Key Missing**\n\n"
+        "Sila pastikan anda telah menambah `GEMINI_API_KEY = \"AIzaSy...\"` di dalam **Streamlit Cloud &rarr; App Settings &rarr; Secrets** (format TOML) dan klik **Save**."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Welcome Message & Interactive Starter Cards (when conversation is empty)

@@ -44,11 +44,14 @@ def generate_node(state: GraphState) -> GraphState:
         sources.append(doc.metadata)
 
     try:
-        llm = ChatGoogleGenerativeAI(
-            model=settings.gemini_model,
-            google_api_key=settings.effective_api_key,
-            temperature=0.0,
-        )
+        api_key = settings.effective_api_key
+        llm_kwargs = {
+            "model": settings.gemini_model,
+            "temperature": 0.0,
+        }
+        if api_key:
+            llm_kwargs["google_api_key"] = api_key
+        llm = ChatGoogleGenerativeAI(**llm_kwargs)
     except Exception as e:
         logger.error(f"Failed to initialize ChatGoogleGenerativeAI: {e}")
         generation = f"Ralat sistem: {e}"
