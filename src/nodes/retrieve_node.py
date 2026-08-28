@@ -9,7 +9,10 @@ Combines high-accuracy search signals:
 6. Jina AI Multilingual Cross-Encoder Reranking with Adaptive Score-Margin Pruning
 """
 
-from typing import Dict, List, Tuple
+import threading
+import time
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 
@@ -26,6 +29,93 @@ from src.utils.logger import logger
 from src.utils.normalizer import normalize_query
 from src.vectorstore.qdrant_client import QdrantManager, get_embedding_function
 
+
+# ---------------------------------------------------------------------------
+# Stage-level performance instrumentation
+# ---------------------------------------------------------------------------
+
+class _Timer:
+    """Context manager for logging stage-level latency."""
+
+    __slots__ = ("name", "_start")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._start = 0.0
+
+    def __enter__(self) -> "_Timer":
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        elapsed_ms = (time.perf_counter() - self._start) * 1000
+        logger.debug(f"[{self.name}] completed in {elapsed_ms:.1f}ms")
+
+
+# ---------------------------------------------------------------------------
+# Cached singletons (avoid per-call object re-creation)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _get_retrieval_embedder():
+    """Returns a cached embedding function configured for retrieval queries."""
+    return get_embedding_function(task_type="retrieval_query")
+
+
+@lru_cache(maxsize=1)
+def _get_qdrant() -> QdrantManager:
+    """Returns a cached QdrantManager singleton."""
+    return QdrantManager(
+        storage_path=settings.qdrant_storage_path,
+        collection_name=settings.qdrant_collection_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# BM25 index cache with count-based invalidation
+# ---------------------------------------------------------------------------
+
+_bm25_lock = threading.Lock()
+_bm25_cache: Dict[str, object] = {"key": None, "index": None}
+
+
+def _get_bm25_index(qdrant: QdrantManager) -> Optional[BM25Index]:
+    """Returns a cached BM25 index, rebuilding only when the corpus size changes.
+
+    Uses a lightweight count-based cache key. The index is rebuilt when the
+    point count in Qdrant changes (e.g. after self-learning adds new variants).
+
+    Args:
+        qdrant: QdrantManager instance to scroll documents from.
+
+    Returns:
+        A BM25Index instance, or None if the collection is empty.
+    """
+    doc_count = qdrant.get_collection_count()
+    cache_key = f"{qdrant.collection_name}:{doc_count}"
+
+    with _bm25_lock:
+        if _bm25_cache["key"] == cache_key and _bm25_cache["index"] is not None:
+            return _bm25_cache["index"]
+
+    # Build outside the lock to avoid blocking concurrent queries during scroll
+    all_docs = qdrant.scroll_all_documents()
+    if not all_docs:
+        return None
+
+    index = BM25Index(all_docs)
+    logger.info(f"Rebuilt BM25 index ({doc_count} docs, collection: {qdrant.collection_name})")
+
+    with _bm25_lock:
+        _bm25_cache["key"] = cache_key
+        _bm25_cache["index"] = index
+
+    return index
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
 
 def _deduplicate_by_faq_id(
     results: List[Tuple[Document, float]],
@@ -84,6 +174,10 @@ def _vector_search(
     )
 
 
+# ---------------------------------------------------------------------------
+# Main retrieval node
+# ---------------------------------------------------------------------------
+
 def retrieve_node(state: GraphState) -> GraphState:
     """LangGraph node that retrieves relevant documents using a high-accuracy multi-signal pipeline.
 
@@ -103,102 +197,103 @@ def retrieve_node(state: GraphState) -> GraphState:
     chat_history = state.get("chat_history", [])
     logger.info(f"Initiating retrieval for question: '{raw_question}' (history turns: {len(chat_history)})")
 
+    _EMPTY_RESULT: GraphState = {"documents": [], "relevance_score": 0.0}
+
     try:
         # 1. Conversational Query Rewriting (resolves context from previous turns)
-        rewritten_query = rewrite_conversational_query(raw_question, chat_history)
+        with _Timer("query_rewriting"):
+            rewritten_query = rewrite_conversational_query(raw_question, chat_history)
 
         # 2. Slang and abbreviation normalization
         search_query = normalize_query(rewritten_query) or rewritten_query or raw_question
         if search_query.lower() != raw_question.lower():
             logger.info(f"Processed search query: '{raw_question}' -> '{search_query}'")
 
-        embedder = get_embedding_function(task_type="retrieval_query")
-        qdrant = QdrantManager(
-            storage_path=settings.qdrant_storage_path,
-            collection_name=settings.qdrant_collection_name,
-        )
-        if qdrant.get_collection_count() == 0 and settings.effective_api_key:
-            logger.info("Empty Qdrant collection detected during retrieval. Running on-demand indexing...")
-            try:
-                from src.ingestion.indexer import run_indexing
-                run_indexing(recreate_collection=False)
-            except Exception as idx_err:
-                logger.warning(f"On-demand FAQ indexing failed: {idx_err}")
+        embedder = _get_retrieval_embedder()
+        qdrant = _get_qdrant()
 
-        fetch_limit = max(settings.retrieval_candidate_count, settings.top_k_results * 3)
+        fetch_limit = max(
+            settings.retrieval_candidate_count,
+            settings.top_k_results * settings.fetch_limit_multiplier,
+        )
 
         # Collect all retrieval signals with associated weights
         result_lists: List[List[Tuple[Document, float]]] = []
         weights: List[float] = []
         signal_names: List[str] = []
 
-        # --- Signal 1: Primary Dense Vector Search (Weight = 1.0) ---
-        primary_results = _vector_search(qdrant, embedder, search_query, fetch_limit)
+        # --- Signal 1: Primary Dense Vector Search ---
+        with _Timer("vector_search"):
+            primary_results = _vector_search(qdrant, embedder, search_query, fetch_limit)
         best_vector_score = primary_results[0][1] if primary_results else 0.0
 
         if primary_results:
             result_lists.append(primary_results)
-            weights.append(1.0)
+            weights.append(settings.rrf_weight_primary_vector)
             signal_names.append(f"vector({len(primary_results)})")
 
-        # --- Signal 2: Multi-Query Expansion Search (Weight = 0.6) ---
-        # Optimization: Skip expensive LLM multi-query generation if primary vector search is already high confidence (>= 0.88)
-        if settings.enable_multi_query and best_vector_score < 0.88:
-            query_variants = generate_multi_queries(search_query)
-            for variant in query_variants:
-                if variant.lower() != search_query.lower():
-                    variant_results = _vector_search(qdrant, embedder, variant, fetch_limit)
-                    if variant_results:
-                        result_lists.append(variant_results)
-                        weights.append(0.6)
-                        if variant_results[0][1] > best_vector_score:
-                            best_vector_score = variant_results[0][1]
+        # --- Signal 2: Multi-Query Expansion Search ---
+        # Optimization: Skip expensive LLM multi-query generation if primary vector
+        # search is already high confidence (above configurable threshold)
+        if settings.enable_multi_query and best_vector_score < settings.multi_query_skip_threshold:
+            with _Timer("multi_query_expansion"):
+                query_variants = generate_multi_queries(search_query)
+                variants_with_results = 0
+                for variant in query_variants:
+                    if variant.lower() != search_query.lower():
+                        variant_results = _vector_search(qdrant, embedder, variant, fetch_limit)
+                        if variant_results:
+                            result_lists.append(variant_results)
+                            weights.append(settings.rrf_weight_multi_query)
+                            variants_with_results += 1
+                            if variant_results[0][1] > best_vector_score:
+                                best_vector_score = variant_results[0][1]
 
-            if query_variants:
-                signal_names.append(f"multi-query({len(query_variants)} variants)")
+            if variants_with_results > 0:
+                signal_names.append(f"multi-query({variants_with_results}/{len(query_variants)} effective)")
 
-        # --- Signal 3: BM25 Lexical Keyword Search (Weight = 0.8) ---
+        # --- Signal 3: BM25 Lexical Keyword Search ---
         if settings.enable_hybrid_search:
-            all_docs = qdrant.scroll_all_documents()
-            if all_docs:
-                bm25_index = BM25Index(all_docs)
-                bm25_results = bm25_index.search(query=search_query, top_k=fetch_limit)
-                if bm25_results:
-                    result_lists.append(bm25_results)
-                    weights.append(0.8)
-                    signal_names.append(f"bm25({len(bm25_results)})")
+            with _Timer("bm25_search"):
+                bm25_index = _get_bm25_index(qdrant)
+                if bm25_index is not None:
+                    bm25_results = bm25_index.search(query=search_query, top_k=fetch_limit)
+                    if bm25_results:
+                        result_lists.append(bm25_results)
+                        weights.append(settings.rrf_weight_bm25)
+                        signal_names.append(f"bm25({len(bm25_results)})")
 
         # --- Fuse all signals via Weighted RRF ---
         if len(result_lists) > 1:
             logger.info(f"Fusing {len(result_lists)} signals via Weighted RRF: {' + '.join(signal_names)}")
-            candidates = reciprocal_rank_fusion(
-                result_lists=result_lists,
-                weights=weights,
-                top_n=fetch_limit,
-            )
+            with _Timer("rrf_fusion"):
+                candidates = reciprocal_rank_fusion(
+                    result_lists=result_lists,
+                    weights=weights,
+                    top_n=fetch_limit,
+                )
         elif result_lists:
             candidates = result_lists[0]
         else:
             logger.info("No candidate documents retrieved from any signal.")
-            return {
-                **state,
-                "documents": [],
-                "relevance_score": 0.0,
-            }
+            return _EMPTY_RESULT
 
         # 7. Deduplicate candidates by unique FAQ ID
         deduplicated = _deduplicate_by_faq_id(candidates)
 
         # 8. Rerank candidates with Jina AI Cross-Encoder
         if settings.enable_reranker and deduplicated:
-            reranker = JinaReranker()
-            # Fetch extra candidates for reranking to allow intelligent pruning
-            rerank_limit = max(settings.top_k_results * 2, 6)
-            top_results = reranker.rerank(
-                query=search_query,
-                candidates=deduplicated[:rerank_limit],
-                top_n=rerank_limit,
+            rerank_limit = max(
+                settings.top_k_results * settings.rerank_limit_multiplier,
+                settings.rerank_limit_floor,
             )
+            with _Timer("jina_rerank"):
+                reranker = JinaReranker()
+                top_results = reranker.rerank(
+                    query=search_query,
+                    candidates=deduplicated[:rerank_limit],
+                    top_n=rerank_limit,
+                )
             # Use cross-encoder score as authoritative score if available
             has_reranker_scores = bool(top_results and settings.effective_jina_api_key)
         else:
@@ -206,11 +301,7 @@ def retrieve_node(state: GraphState) -> GraphState:
             has_reranker_scores = False
 
         if not top_results:
-            return {
-                **state,
-                "documents": [],
-                "relevance_score": 0.0,
-            }
+            return _EMPTY_RESULT
 
         # 9. Dynamic Score-Margin Pruning (removes noisy tail documents)
         if settings.enable_adaptive_pruning and has_reranker_scores:
@@ -237,15 +328,14 @@ def retrieve_node(state: GraphState) -> GraphState:
             f"(Cross-encoder: {top_ranked_score:.4f}, Best vector: {best_vector_score:.4f})"
         )
         return {
-            **state,
             "documents": documents,
             "relevance_score": authoritative_score,
         }
 
+    except (ConnectionError, TimeoutError, OSError) as e:
+        logger.error(f"Retrieval failed due to external service error: {e}")
+        return _EMPTY_RESULT
+
     except Exception as e:
-        logger.error(f"Retrieval failed: {e}")
-        return {
-            **state,
-            "documents": [],
-            "relevance_score": 0.0,
-        }
+        logger.exception(f"Unexpected retrieval error: {e}")
+        return _EMPTY_RESULT

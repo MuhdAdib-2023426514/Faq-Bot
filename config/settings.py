@@ -100,6 +100,37 @@ class Settings(BaseSettings):
         default=3,
         description="Number of query variants to generate for multi-query retrieval",
     )
+
+    # RRF Signal Weights & Retrieval Thresholds
+    rrf_weight_primary_vector: float = Field(
+        default=1.0,
+        description="RRF weight for the primary dense vector search signal",
+    )
+    rrf_weight_multi_query: float = Field(
+        default=0.6,
+        description="RRF weight for multi-query expansion variant signals",
+    )
+    rrf_weight_bm25: float = Field(
+        default=0.8,
+        description="RRF weight for the BM25 lexical keyword search signal",
+    )
+    multi_query_skip_threshold: float = Field(
+        default=0.88,
+        description="Skip multi-query expansion when primary vector score exceeds this threshold",
+    )
+    fetch_limit_multiplier: int = Field(
+        default=3,
+        description="Multiplier applied to top_k_results to determine initial candidate fetch count",
+    )
+    rerank_limit_multiplier: int = Field(
+        default=2,
+        description="Multiplier applied to top_k_results to determine reranking candidate count",
+    )
+    rerank_limit_floor: int = Field(
+        default=6,
+        description="Minimum number of candidates to send for reranking",
+    )
+
     enable_guardrails: bool = Field(
         default=True,
         description="Whether to activate prompt injection and safety guardrail checks",
